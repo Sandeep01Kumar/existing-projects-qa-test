@@ -67,6 +67,16 @@ const MAX_TIMER_MS = 3600000; // 1 hour
 // enough to exhaust process memory. The previous ceiling was the entire
 // safe-integer range, which offered no real protection.
 const MAX_BODY_BYTES_LIMIT = 104857600; // 100 MiB
+// Practical maximum JSON nesting depth for request bodies (Finding F1). A
+// pathologically deep — though syntactically VALID — JSON payload forces
+// JSON.parse into a recursive descent that overflows the V8 call stack; because
+// the stack is already exhausted at that point, even the malformed-JSON 400 path
+// re-throws and the client fault surfaces as a misleading 500. The default depth
+// (200) is far beyond any legitimate payload yet an order of magnitude below the
+// overflow threshold. This ceiling (1000) bounds how high MAX_JSON_DEPTH may be
+// raised so a misconfiguration can never push the limit back into the
+// stack-exhaustion range and re-enable the vector.
+const MAX_JSON_DEPTH_LIMIT = 1000;
 
 // Strict, full-string decimal integer parse. Unlike parseInt, this rejects
 // trailing junk ("0junk"), exponent/hex forms, whitespace-only/empty strings,
@@ -115,6 +125,12 @@ const config = {
   headersTimeoutMs: readIntSetting('HEADERS_TIMEOUT_MS', 10000, 1, MAX_TIMER_MS),
   keepAliveTimeoutMs: readIntSetting('KEEPALIVE_TIMEOUT_MS', 5000, 1, MAX_TIMER_MS),
   shutdownGraceMs: readIntSetting('SHUTDOWN_GRACE_MS', 10000, 1, MAX_TIMER_MS),
+  // Max JSON nesting depth accepted on a request body (Finding F1). Must be at
+  // least 1 (permit a single-level object/array) and no larger than
+  // MAX_JSON_DEPTH_LIMIT so a misconfiguration cannot re-open the stack-overflow
+  // vector. Bodies nested deeper are rejected with a deterministic 400 BEFORE
+  // JSON.parse runs (see jsonDepthExceeds), so parse only ever sees bounded input.
+  maxJsonDepth: readIntSetting('MAX_JSON_DEPTH', 200, 1, MAX_JSON_DEPTH_LIMIT),
 };
 
 // Relationship invariant: headers must time out no later than the whole request,
@@ -514,6 +530,42 @@ async function handleHealth(req, res) {
   });
 }
 
+// Determine whether a JSON text nests deeper than `maxDepth`, scanning
+// ITERATIVELY so the check itself can never recurse or overflow the stack
+// (Finding F1). Only structural brackets OUTSIDE string literals count toward
+// depth: we track whether we are inside a "..." string and honor backslash
+// escapes, so braces/brackets embedded in string values — or an escaped quote —
+// are correctly ignored. Returns true as soon as the running depth exceeds the
+// limit (early exit; O(n), no allocation). Called BEFORE JSON.parse so that
+// JSON.parse only ever runs on bounded-depth input and cannot exhaust the stack.
+function jsonDepthExceeds(text, maxDepth) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    if (inString) {
+      if (escaped) {
+        escaped = false; // this char is consumed by the preceding backslash
+      } else if (ch === 0x5c) {
+        escaped = true; // backslash: escape the next char
+      } else if (ch === 0x22) {
+        inString = false; // closing quote
+      }
+      continue;
+    }
+    if (ch === 0x22) {
+      inString = true; // opening quote
+    } else if (ch === 0x7b || ch === 0x5b) { // '{' or '['
+      depth += 1;
+      if (depth > maxDepth) return true;
+    } else if (ch === 0x7d || ch === 0x5d) { // '}' or ']'
+      if (depth > 0) depth -= 1;
+    }
+  }
+  return false;
+}
+
 async function handleEcho(req, res) {
   const ctype = (req.headers['content-type'] || '')
     .split(';')[0].trim().toLowerCase();
@@ -535,12 +587,27 @@ async function handleEcho(req, res) {
     throw err;
   }
   let parsed;
-  try {
-    // The body has been fully consumed here, so a malformed-JSON 400 is safe to
-    // send on a keep-alive connection (no unread bytes remain).
-    parsed = raw.length ? JSON.parse(raw.toString('utf8')) : {};
-  } catch (_) {
-    return sendError(res, 400, 'Malformed JSON body');
+  if (raw.length) {
+    const text = raw.toString('utf8');
+    // Finding F1: pre-validate nesting depth BEFORE JSON.parse. A pathologically
+    // deep — but syntactically valid — payload would otherwise drive JSON.parse
+    // into a recursive descent that overflows the call stack; with the stack
+    // already exhausted, even the malformed-JSON 400 path below would re-throw and
+    // the client fault would surface as a misleading 500. Rejecting over-depth
+    // input here maps the client fault to a deterministic 400 (a 4xx, per the AAP)
+    // and guarantees JSON.parse only ever runs on bounded-depth input.
+    if (jsonDepthExceeds(text, config.maxJsonDepth)) {
+      return sendError(res, 400, 'JSON nesting depth exceeds maximum allowed');
+    }
+    try {
+      // The body has been fully consumed here, so a malformed-JSON 400 is safe to
+      // send on a keep-alive connection (no unread bytes remain).
+      parsed = JSON.parse(text);
+    } catch (_) {
+      return sendError(res, 400, 'Malformed JSON body');
+    }
+  } else {
+    parsed = {};
   }
   sendJson(res, 200, { received: parsed });
 }

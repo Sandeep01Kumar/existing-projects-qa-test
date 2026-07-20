@@ -44,6 +44,7 @@ All settings are environment variables with safe defaults:
 | `HEADERS_TIMEOUT_MS` | `10000` | Maximum time to receive request headers |
 | `KEEPALIVE_TIMEOUT_MS` | `5000` | Keep-alive timeout for idle connections |
 | `SHUTDOWN_GRACE_MS` | `10000` | Grace period before a forced exit during shutdown |
+| `MAX_JSON_DEPTH` | `200` | Maximum accepted JSON nesting depth for a `POST /echo` body; deeper payloads receive `400` (range-checked at startup, ceiling `1000`) |
 
 > Header and request timeouts are **actively enforced**: the server derives a bounded incomplete-request check interval from the smallest configured timeout, so a slow or byte-trickling client is disconnected shortly after its deadline rather than lingering. A timeout enforced at the protocol layer is surfaced as `408`. Configured timeout and body-size values are also range-checked at startup (e.g. body size is capped at 100 MiB and timers at 1 hour); an out-of-range value makes the server log a configuration error and refuse to start.
 
@@ -61,7 +62,7 @@ All settings are environment variables with safe defaults:
 | Code | When |
 |---|---|
 | `200` | Successful request |
-| `400` | Invalid URL or malformed JSON body |
+| `400` | Invalid URL, malformed JSON body, or a JSON body nested deeper than `MAX_JSON_DEPTH` |
 | `404` | Unknown route |
 | `405` | HTTP method not allowed (only `GET`, `HEAD`, `POST` are accepted); also returned for `CONNECT` |
 | `408` | Request/headers timeout enforced at the protocol layer (slow or incomplete request) |
@@ -75,11 +76,13 @@ All error responses are generic JSON of the form `{ "error": "<status message>",
 
 ### Protocol-Level Handling
 
-Traffic that never reaches normal routing is still answered defensively with the same generic JSON shape (never a bare or default Node.js response):
+Traffic that never reaches normal routing is still answered defensively with the same generic JSON shape for every case the application can intercept:
 
 - **Malformed request line/headers** (`clientError`) → `400`; a request/headers timeout detected at this layer → `408`.
 - **`CONNECT`** (tunneling is not supported) → `405` with an `Allow` header.
 - **Unsupported `Expect` request header** → `417`.
+
+> **Platform exception.** A few protocol violations are rejected by the Node.js HTTP parser *before* any JavaScript handler can run — most notably an `HTTP/1.1` request that omits the mandatory `Host` header, which Node answers with its own **bare `400`** (not the JSON envelope) and closes the connection. This built-in protection cannot be intercepted without disabling it, so those rare, non-conformant requests receive Node's default `400` rather than the application's JSON body. The outcome is still a safe `400` with the connection closed.
 
 ## Graceful Shutdown
 
@@ -101,7 +104,7 @@ Process-level `uncaughtException` and `unhandledRejection` handlers log a **sani
 
 - **Error handling:** try/catch around handler logic, `req`/`res` `error`/`aborted` listeners, protocol-level `clientError`/`CONNECT`/`Expect` handling, `server.on('error')` for `EADDRINUSE`/`EACCES`, and process-level `uncaughtException`/`unhandledRejection` guards.
 - **Graceful shutdown:** connection draining, idle keep-alive socket teardown, a bounded force-exit timer, and a monotonic **non-zero** exit code on forced or fatal termination.
-- **Input validation:** method allow-list (`405`), WHATWG `URL` parsing (`400`), `Content-Type` verification (`415`), body-size cap (`413`), and guarded `JSON.parse` (`400`).
+- **Input validation:** method allow-list (`405`), WHATWG `URL` parsing (`400`), `Content-Type` verification (`415`), body-size cap (`413`), a JSON nesting-depth cap (`400`, bounded *before* `JSON.parse` so a pathologically deep payload cannot exhaust the call stack), and guarded `JSON.parse` (`400`).
 - **Resource cleanup:** configured `requestTimeout`, `headersTimeout`, `keepAliveTimeout`, and socket timeouts; oversized/stalled bodies aborted; timers cleared on shutdown.
 - **Robust request processing:** streamed body handling with early abort, consistent JSON responses, client-abort tolerance, and a health/readiness endpoint for orchestration probes.
 - **Structured, resilient logging:** newline-delimited JSON to stdout/stderr, with secrets (credentials, bearer tokens) redacted, control characters stripped, and messages length-bounded; stack traces and runtime build details are never logged. A broken or blocked log sink (for example, a closed pipe) is isolated and never crashes the server.

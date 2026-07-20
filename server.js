@@ -9,11 +9,64 @@
 const http = require('http');
 const os = require('os');
 
+// --- Finding 5: log-sink resilience (defined FIRST so every subsequent log
+// write, including early configuration-error writes emitted during module load,
+// is protected). A broken or blocked stdout/stderr must NEVER crash or block the
+// HTTP service. ---
+//
+// stdout/stderr emit 'error' ASYNCHRONOUSLY (e.g. EPIPE once a piped reader
+// closes its end of the pipe). Without an 'error' listener on the stream, that
+// event is re-thrown as an uncaughtException and terminates the process. We
+// attach a silent listener that simply marks the stream broken; it must not log
+// (that would recurse straight back into the failing sink).
+const brokenLogStreams = new WeakSet();
+function guardLogStream(stream) {
+  if (stream && typeof stream.on === 'function') {
+    stream.on('error', () => {
+      try { brokenLogStreams.add(stream); } catch (_) { /* never throw from a guard */ }
+    });
+  }
+}
+guardLogStream(process.stdout);
+guardLogStream(process.stderr);
+
+// Bounded-backpressure, non-throwing write. Returns false when the line is
+// dropped: either the sink was previously marked broken, or its internal buffer
+// already exceeds the limit (dropping here prevents unbounded memory growth
+// under a stalled consumer, CWE-400). The write callback swallows ASYNCHRONOUS
+// write errors (e.g. a late EPIPE) so they can never reach the process-level
+// guards and take the service down.
+const LOG_BACKPRESSURE_LIMIT_BYTES = 1048576; // 1 MiB queued -> start dropping lines
+function writeLog(stream, line) {
+  try {
+    if (!stream || brokenLogStreams.has(stream)) return false;
+    if (typeof stream.writableLength === 'number'
+        && stream.writableLength > LOG_BACKPRESSURE_LIMIT_BYTES) {
+      return false;
+    }
+    stream.write(line, () => { /* swallow async write errors (e.g. EPIPE) */ });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // --- Configuration (environment-overridable, strictly validated) ---
-// Upper bound for any millisecond timer: Node's setTimeout clamps delays above
-// 2^31-1 ms to 1 ms and emits a TimeoutOverflowWarning, silently disabling the
-// protection — so such values are rejected outright rather than accepted.
-const MAX_TIMER_MS = 2147483647;
+// Practical upper bound for any millisecond timer (Finding 4). Two concerns:
+//   1. Node's setTimeout clamps delays above 2^31-1 ms to 1 ms (emitting a
+//      TimeoutOverflowWarning), which would SILENTLY DISABLE the protection.
+//   2. Even below that overflow point, a multi-day timeout (e.g. a config typo
+//      with an extra digit) would effectively disable the slow-client / shutdown
+//      protections it is meant to provide.
+// We therefore impose a strict PRACTICAL ceiling of 1 hour — generous for any
+// legitimate timeout yet far below the overflow point — and reject anything
+// larger outright so a misconfiguration can never silently weaken a defense.
+const MAX_TIMER_MS = 3600000; // 1 hour
+// Practical maximum request-body size (Finding 4). The default is 1 MiB; this
+// hard ceiling (100 MiB) prevents a typo from configuring a body cap large
+// enough to exhaust process memory. The previous ceiling was the entire
+// safe-integer range, which offered no real protection.
+const MAX_BODY_BYTES_LIMIT = 104857600; // 100 MiB
 
 // Strict, full-string decimal integer parse. Unlike parseInt, this rejects
 // trailing junk ("0junk"), exponent/hex forms, whitespace-only/empty strings,
@@ -53,8 +106,9 @@ const config = {
   // tests). The actual bound port is reported from server.address() at startup.
   port: readIntSetting('PORT', 3000, 0, 65535),
   host: process.env.HOST || '0.0.0.0',
-  // Body cap must be at least 1 byte; the only ceiling is the safe-integer range.
-  maxBodyBytes: readIntSetting('MAX_BODY_BYTES', 1048576, 1, Number.MAX_SAFE_INTEGER),
+  // Body cap must be at least 1 byte and no larger than MAX_BODY_BYTES_LIMIT so
+  // an oversized value cannot disable memory protection (Finding 4).
+  maxBodyBytes: readIntSetting('MAX_BODY_BYTES', 1048576, 1, MAX_BODY_BYTES_LIMIT),
   // Timeouts/grace must be strictly positive — 0 would DISABLE the protection —
   // and within the timer ceiling to avoid overflow-to-1ms.
   requestTimeoutMs: readIntSetting('REQUEST_TIMEOUT_MS', 30000, 1, MAX_TIMER_MS),
@@ -93,25 +147,62 @@ function safeTimestamp() {
   }
 }
 
+// Finding 6: redact secret-bearing tokens from any free-form string BEFORE it
+// can reach the logs (CWE-532: insertion of sensitive information into a log
+// file). Two shapes are covered:
+//   1. "key = value" / "key: value" pairs where the key names a credential.
+//   2. "Bearer <token>" authorization values (space-separated, no delimiter).
+const SECRET_KEY_RE = /\b(authorization|auth|token|access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|secret|password|passwd|pwd|session[_-]?id|session|bearer)(\s*[=:]\s*)([^\s&;,"']+)/gi;
+const BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi;
+
+// Produce a log-safe scalar string: redact secrets, strip control characters
+// (defense against log-injection / newline forging), and bound the length so an
+// attacker-influenced message cannot bloat a log line without limit. Never
+// throws and never dereferences custom coercion hooks beyond a guarded String().
+function sanitizeMessage(value, maxLen) {
+  let s;
+  try {
+    s = typeof value === 'string' ? value : String(value);
+  } catch (_) {
+    return '(unloggable)';
+  }
+  try {
+    // Order matters: redact "Bearer <token>" FIRST. Otherwise the key/value
+    // pass below would treat the literal word "Bearer" as the value of an
+    // "authorization:" key and stop, leaving the real token exposed.
+    s = s.replace(BEARER_RE, 'Bearer [REDACTED]');
+    s = s.replace(SECRET_KEY_RE, '$1$2[REDACTED]');
+    // Replace ASCII control characters (incl. CR/LF/TAB and DEL) with a space.
+    s = s.replace(/[\u0000-\u001f\u007f]/g, ' ');
+    const cap = typeof maxLen === 'number' && maxLen > 0 ? maxLen : 200;
+    if (s.length > cap) s = s.slice(0, cap) + '...';
+    return s;
+  } catch (_) {
+    return '(unloggable)';
+  }
+}
+
 // Normalize ANY thrown or rejected value into a plain, safe descriptor without
 // dereferencing untrusted getters or invoking custom string coercion. Handles
 // Errors, primitives, null/undefined, and hostile objects. Never throws.
+// Finding 6: the returned message is always sanitized, and the stack is
+// deliberately NOT captured — stack frames leak internal file paths and code
+// structure into the logs and must not be recorded.
 function describeThrown(value) {
   const out = { name: 'Unknown', message: 'unknown error' };
   try {
     if (value instanceof Error) {
       out.name = typeof value.name === 'string' ? value.name : 'Error';
-      out.message = typeof value.message === 'string' ? value.message : '(no message)';
-      if (typeof value.stack === 'string') out.stack = value.stack;
+      out.message = sanitizeMessage(typeof value.message === 'string' ? value.message : '(no message)');
       return out;
     }
     const t = typeof value;
     if (value === null) { out.name = 'null'; out.message = 'null'; return out; }
     if (t === 'undefined') { out.name = 'undefined'; out.message = 'undefined'; return out; }
-    if (t === 'string') { out.name = 'string'; out.message = value; return out; }
+    if (t === 'string') { out.name = 'string'; out.message = sanitizeMessage(value); return out; }
     if (t === 'number' || t === 'boolean' || t === 'bigint') {
       out.name = t;
-      out.message = String(value); // primitives coerce safely, no custom hooks
+      out.message = sanitizeMessage(String(value)); // primitives coerce safely, no custom hooks
       return out;
     }
     // object / function / symbol: use the built-in tag, which does NOT invoke
@@ -159,15 +250,14 @@ function logLine(stream, level, message, fields) {
     }
   }
 
-  // Primary write guard; on failure fall back to stderr, then give up silently.
-  try {
-    stream.write(line);
-  } catch (_) {
-    try {
-      if (stream !== process.stderr) process.stderr.write(line);
-    } catch (_) {
-      // Nothing more we can safely do; the logger must never throw.
-    }
+  // Finding 5: write via the bounded, non-throwing helper. If the primary sink
+  // is broken or backpressured the helper returns false; fall back to stderr
+  // once (also guarded) and otherwise give up silently. A failed log write must
+  // never crash or block the HTTP service, and a late async EPIPE from the
+  // stream is swallowed by writeLog's write callback plus the stream's 'error'
+  // guard installed at module load.
+  if (!writeLog(stream, line)) {
+    if (stream !== process.stderr) writeLog(process.stderr, line);
   }
 }
 const log = {
@@ -204,8 +294,14 @@ const STATUS_MESSAGES = {
   400: 'Bad Request',
   404: 'Not Found',
   405: 'Method Not Allowed',
+  // Finding 3/7: a headers/request timeout enforced at the protocol layer is
+  // surfaced as a generic 408 rather than Node's bare default response.
+  408: 'Request Timeout',
   413: 'Payload Too Large',
   415: 'Unsupported Media Type',
+  // Finding 7: unsupported HTTP expectations are surfaced as a generic 417 via
+  // the centralized responder instead of Node's bare default 417.
+  417: 'Expectation Failed',
   500: 'Internal Server Error',
   503: 'Service Unavailable',
 };
@@ -261,10 +357,21 @@ function failRequest(res, statusCode) {
 function drainAndClose(req, res) {
   const finish = () => {
     try {
-      if (req && !req.complete && !req.destroyed) req.destroy();
+      if (req && !req.complete && !req.destroyed) {
+        // Finding 1: flag this teardown as SERVER-initiated so the request
+        // 'aborted' listener does not misreport it as a client abort.
+        req._serverInitiatedTeardown = true;
+        req.destroy();
+      }
     } catch (_) { /* no-throw */ }
   };
-  if (res.writableEnded) finish();
+  // Finding 1: `res.writableEnded` becomes true the instant res.end() is CALLED —
+  // long before the bytes are flushed to the client — so keying teardown off it
+  // could destroy the request (and its socket) mid-flush and truncate the very
+  // error response we are trying to deliver. Wait for `res.writableFinished` (all
+  // bytes handed to the socket) or the 'finish'/'close' events so the rejection
+  // is provably delivered BEFORE the unread body is aborted.
+  if (res.writableFinished) finish();
   else {
     res.once('finish', finish);
     res.once('close', finish);
@@ -300,6 +407,7 @@ function readBody(req, maxBytes) {
       req.removeListener('end', onEnd);
       req.removeListener('error', onError);
       req.removeListener('aborted', onAborted);
+      req.removeListener('close', onClose);
     }
     function onData(chunk) {
       if (settled) return;
@@ -334,17 +442,71 @@ function readBody(req, maxBytes) {
       err.aborted = true;
       reject(err);
     }
+    // Finding 11: settle if the request CLOSES before a normal 'end' (client went
+    // away or the socket was torn down). 'close' is the modern, always-emitted
+    // terminal signal, so this guarantees the caller can never hang awaiting
+    // 'data'/'end' events that will never arrive. Idempotent via `settled`.
+    function onClose() {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (req.complete) {
+        // A full message was received just before 'close'; deliver its body.
+        resolve(Buffer.concat(chunks));
+      } else {
+        const err = new Error('Client Aborted');
+        err.aborted = true;
+        reject(err);
+      }
+    }
+
+    // Finding 11: initial terminal-state guard. If the request is ALREADY gone
+    // (destroyed/aborted) before listeners attach, settle immediately rather than
+    // waiting for events that can no longer fire. If the message already fully
+    // arrived (e.g. a body-less GET/HEAD whose 'end' preceded this call), resolve
+    // with an empty body at once — this also bounds body-less health probes.
+    if (req.destroyed) {
+      settled = true;
+      const err = new Error('Client Aborted');
+      err.aborted = true;
+      reject(err);
+      return;
+    }
+    if (req.complete) {
+      settled = true;
+      resolve(Buffer.alloc(0));
+      return;
+    }
     req.on('data', onData);
     req.on('end', onEnd);
     req.on('error', onError);
     req.on('aborted', onAborted);
+    req.on('close', onClose);
   });
 }
 
 // --- Route handlers ---
-function handleHealth(req, res) {
+async function handleHealth(req, res) {
+  // Finding 2: the body-size cap must apply to EVERY route, not just POST /echo.
+  // A normal probe carries no body, so readBody resolves immediately; a body-
+  // bearing or slowly-trickled health request is bounded by the same reader so
+  // it can neither bypass MAX_BODY_BYTES nor hold the socket open past the
+  // response. Oversized bodies are rejected with 413 (then the body is aborted).
+  try {
+    await readBody(req, config.maxBodyBytes);
+  } catch (err) {
+    if (err.statusCode === 413) {
+      return endWithError(req, res, 413, 'Body exceeds maximum allowed size');
+    }
+    if (err.aborted) return; // client went away; nothing to send
+    throw err;
+  }
+  // Finding 10: dispatch() applies the shutdown gate synchronously and returns
+  // 503 for every new request once draining begins, so a health handler only
+  // runs while NOT draining. The previously-conditional `status: 'draining'`
+  // value was therefore unreachable dead code; report a constant 'ok'.
   sendJson(res, 200, {
-    status: shuttingDown ? 'draining' : 'ok',
+    status: 'ok',
     uptimeSeconds: Math.round(process.uptime()),
     pid: process.pid,
     host: os.hostname(),
@@ -444,8 +606,20 @@ function requestHandler(req, res) {
 
   // Log-safe: never emit the raw URL (query/userinfo may hold secrets) (Finding 6).
   req.on('error', (err) => log.warn('request stream error', { error: describeThrown(err).message }));
-  res.on('error', (err) => log.warn('response stream error', { error: describeThrown(err).message }));
-  req.on('aborted', () => log.warn('request aborted by client', { path: safePath(req) }));
+  res.on('error', (err) => {
+    log.warn('response stream error', { error: describeThrown(err).message });
+    // Finding 11: a response-stream error means no further output can be
+    // delivered; explicitly finalize by tearing down the socket rather than
+    // leaving it half-open until the inactivity timeout. Guarded, no-throw.
+    try { if (!res.destroyed && typeof res.destroy === 'function') res.destroy(); } catch (_) { /* no-throw */ }
+  });
+  req.on('aborted', () => {
+    // Finding 1: when WE initiated the teardown (aborting an unread body after an
+    // early error response), 'aborted' fires but it is NOT a client abort — do
+    // not mislabel it in the logs.
+    if (req._serverInitiatedTeardown) return;
+    log.warn('request aborted by client', { path: safePath(req) });
+  });
 
   Promise.resolve()
     .then(() => dispatch(req, res))
@@ -462,7 +636,21 @@ function requestHandler(req, res) {
 }
 
 // --- Server + socket registry ---
-const server = http.createServer(requestHandler);
+// Finding 3: Node checks incomplete-request (headers/request) timeouts on a
+// coarse `connectionsCheckingInterval` that defaults to 30s, so a byte-trickling
+// slow client could survive far past the configured headersTimeout/requestTimeout
+// maxima. Derive a bounded interval from the smallest configured timeout so those
+// maxima are actually enforced: fine enough to catch a slow client shortly after
+// its deadline, yet floored at 20ms and capped at 1s to avoid pathological CPU
+// use. (Config validation guarantees headersTimeout <= requestTimeout.)
+const connectionsCheckingIntervalMs = Math.max(
+  20,
+  Math.min(1000, Math.floor(Math.min(config.headersTimeoutMs, config.requestTimeoutMs) / 4))
+);
+const server = http.createServer(
+  { connectionsCheckingInterval: connectionsCheckingIntervalMs },
+  requestHandler
+);
 server.requestTimeout = config.requestTimeoutMs;
 server.headersTimeout = config.headersTimeoutMs;
 server.keepAliveTimeout = config.keepAliveTimeoutMs;
@@ -480,12 +668,94 @@ server.on('connection', (socket) => {
   socket.on('close', () => sockets.delete(socket));
 });
 
+// --- Finding 7: defensive handling of protocol paths OUTSIDE the normal
+// 'request' event. Malformed request lines/headers, CONNECT, and unsupported
+// expectations never reach requestHandler, so without these listeners they
+// bypass the method allow-list, generic-JSON contract, and observability. Every
+// handler below is no-throw, logs a sanitized/bounded record, returns the
+// intended generic JSON body where a response can still be written, and closes
+// the connection deterministically. ---
+
+// Build a raw HTTP/1.1 response for paths that expose a bare socket (no
+// ServerResponse object). Mirrors the centralized JSON error shape.
+function rawHttpErrorResponse(statusCode, extraHeaders) {
+  const reason = STATUS_MESSAGES[statusCode] || 'Error';
+  const body = JSON.stringify({ error: reason, status: statusCode });
+  let head =
+    'HTTP/1.1 ' + statusCode + ' ' + reason + '\r\n' +
+    'Content-Type: application/json; charset=utf-8\r\n' +
+    'Content-Length: ' + Buffer.byteLength(body) + '\r\n' +
+    'Connection: close\r\n';
+  if (extraHeaders) {
+    for (const key of Object.keys(extraHeaders)) {
+      head += key + ': ' + extraHeaders[key] + '\r\n';
+    }
+  }
+  return head + '\r\n' + body;
+}
+
+// Malformed request line/headers. Node's default sends a bare, non-JSON
+// '400 Bad Request'; emit our generic JSON 400 instead when the socket is still
+// writable, and always close deterministically. A reset/half-open socket cannot
+// receive a body, so it is simply destroyed.
+server.on('clientError', (err, socket) => {
+  const code = err && err.code;
+  try {
+    log.warn('client protocol error', { code, error: describeThrown(err).message });
+  } catch (_) { /* no-throw */ }
+  try {
+    if (!socket || socket.destroyed) return;
+    if (code === 'ECONNRESET' || socket.writable === false) {
+      try { socket.destroy(); } catch (_) { /* no-throw */ }
+      return;
+    }
+    // Finding 3: an incomplete-request/headers timeout (enforced via the bounded
+    // connectionsCheckingInterval) is semantically a 408 Request Timeout; any
+    // other parse failure is a generic 400. Both use our generic JSON shape.
+    const status = code === 'ERR_HTTP_REQUEST_TIMEOUT' ? 408 : 400;
+    socket.end(rawHttpErrorResponse(status));
+  } catch (_) {
+    try { if (socket && !socket.destroyed) socket.destroy(); } catch (_) { /* no-throw */ }
+  }
+});
+
+// CONNECT is not in the method allow-list and never enters requestHandler.
+// Return a generic 405 (advertising Allow) and close, instead of silently
+// dropping the tunnel request.
+server.on('connect', (req, socket) => {
+  try { log.warn('CONNECT method rejected', { path: safePath(req) }); } catch (_) { /* no-throw */ }
+  try {
+    if (!socket || socket.destroyed) return;
+    if (socket.writable === false) {
+      try { socket.destroy(); } catch (_) { /* no-throw */ }
+      return;
+    }
+    socket.end(rawHttpErrorResponse(405, { Allow: Array.from(ALLOWED_METHODS).join(', ') }));
+  } catch (_) {
+    try { if (socket && !socket.destroyed) socket.destroy(); } catch (_) { /* no-throw */ }
+  }
+});
+
+// An Expect header we cannot satisfy (anything other than 100-continue, which
+// Node handles automatically and routes to requestHandler via 'checkContinue').
+// Node's default emits a bare 417; route it through the centralized responder
+// for a consistent generic JSON body and deterministic Connection: close.
+server.on('checkExpectation', (req, res) => {
+  try { log.warn('unsupported expectation', { path: safePath(req) }); } catch (_) { /* no-throw */ }
+  endWithError(req, res, 417, 'Unsupported expectation');
+});
+
 server.on('error', (err) => {
   const code = err && err.code;
-  // Errors surfacing during an intentional shutdown are expected (e.g. sockets
-  // torn down mid-flight); log and let the shutdown sequence own the exit code.
+  // Finding 9: a server-level 'error' during shutdown is treated as FATAL, not
+  // benign — no narrowly identified benign condition is proven here. Escalate the
+  // exit code to non-zero (monotonic; preserve any higher fatal code) and let the
+  // in-progress shutdown machinery own the actual exit, continuing its bounded
+  // cleanup. It must NOT be downgraded to a warning, which would let a supervisor
+  // observe a false success (exit 0) after a fatal event.
   if (shuttingDown) {
-    log.warn('server error during shutdown', { error: describeThrown(err).message, code });
+    if (desiredExitCode < 1) desiredExitCode = 1;
+    log.error('server error during shutdown', { error: describeThrown(err).message, code });
     return;
   }
   // Any other server/listen error means the service is NOT healthy. Emit a
@@ -525,6 +795,12 @@ function gracefulShutdown(signal, exitCode = 0) {
   log.info('shutdown initiated', { signal, exitCode: desiredExitCode });
 
   forceTimer = setTimeout(() => {
+    // Finding 8: reaching the grace deadline means in-flight work did NOT drain
+    // in time and we are force-destroying sockets — an UNCLEAN termination.
+    // Escalate to a non-zero exit (monotonic; preserve any higher fatal code)
+    // BEFORE destroying sockets and exiting, so a forced kill is never reported
+    // as success even when the triggering signal was clean (SIGTERM/SIGINT = 0).
+    if (desiredExitCode < 1) desiredExitCode = 1;
     log.error('grace period elapsed, forcing exit', { exitCode: desiredExitCode });
     for (const s of sockets) { try { s.destroy(); } catch (_) { /* no-throw */ } }
     process.exit(desiredExitCode);
@@ -569,7 +845,9 @@ process.on('uncaughtException', (err) => {
   // Normalize safely: `err` may be any thrown value (e.g. `throw null`), not
   // necessarily an Error, so we must not dereference .message/.stack directly.
   const info = describeThrown(err);
-  log.error('uncaughtException', { error: info.message, name: info.name, stack: info.stack });
+  // Finding 6: log only the sanitized name+message — never the stack (which
+  // would leak internal file paths and code structure).
+  log.error('uncaughtException', { error: info.message, name: info.name });
   gracefulShutdown('uncaughtException', 1);
 });
 process.on('unhandledRejection', (reason) => {
@@ -588,11 +866,12 @@ server.listen(config.port, config.host, () => {
   const addr = server.address();
   const boundHost = (addr && typeof addr === 'object') ? addr.address : config.host;
   const boundPort = (addr && typeof addr === 'object') ? addr.port : config.port;
+  // Finding 6: do NOT emit process.version — the runtime build is internal
+  // environment detail and aids fingerprinting; host/port/pid are sufficient.
   log.info('server listening', {
     host: boundHost,
     port: boundPort,
     pid: process.pid,
-    nodeVersion: process.version,
   });
 });
 

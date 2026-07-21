@@ -42,7 +42,7 @@ All settings are environment variables with safe defaults:
 | `MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes (1 MB); larger bodies receive `413` |
 | `REQUEST_TIMEOUT_MS` | `30000` | Maximum time for a full request (also socket inactivity timeout) |
 | `HEADERS_TIMEOUT_MS` | `10000` | Maximum time to receive request headers |
-| `KEEPALIVE_TIMEOUT_MS` | `5000` | Keep-alive timeout for idle connections |
+| `KEEPALIVE_TIMEOUT_MS` | `5000` | How long an idle keep-alive connection is held open before the server closes it. Node's internal keep-alive buffer is neutralized to `0`, so this value is the **effective** idle-socket timeout (the socket closes at ~this many ms of inactivity, not this value plus an internal buffer) |
 | `SHUTDOWN_GRACE_MS` | `10000` | Grace period before a forced exit during shutdown |
 | `MAX_JSON_DEPTH` | `200` | Maximum accepted JSON nesting depth for a `POST /echo` body; deeper payloads receive `400` (range-checked at startup, ceiling `1000`) |
 
@@ -105,6 +105,6 @@ Process-level `uncaughtException` and `unhandledRejection` handlers log a **sani
 - **Error handling:** try/catch around handler logic, `req`/`res` `error`/`aborted` listeners, protocol-level `clientError`/`CONNECT`/`Expect` handling, `server.on('error')` for `EADDRINUSE`/`EACCES`, and process-level `uncaughtException`/`unhandledRejection` guards.
 - **Graceful shutdown:** connection draining, idle keep-alive socket teardown, a bounded force-exit timer, and a monotonic **non-zero** exit code on forced or fatal termination.
 - **Input validation:** method allow-list (`405`), WHATWG `URL` parsing (`400`), `Content-Type` verification (`415`), body-size cap (`413`), a JSON nesting-depth cap (`400`, bounded *before* `JSON.parse` so a pathologically deep payload cannot exhaust the call stack), and guarded `JSON.parse` (`400`).
-- **Resource cleanup:** configured `requestTimeout`, `headersTimeout`, `keepAliveTimeout`, and socket timeouts; oversized/stalled bodies aborted; timers cleared on shutdown.
+- **Resource cleanup:** configured `requestTimeout`, `headersTimeout`, `keepAliveTimeout` (with Node's internal keep-alive buffer neutralized to `0` so `KEEPALIVE_TIMEOUT_MS` is the effective idle-socket timeout), and socket timeouts; oversized/stalled bodies aborted; timers cleared on shutdown.
 - **Robust request processing:** streamed body handling with early abort, consistent JSON responses, client-abort tolerance, and a health/readiness endpoint for orchestration probes.
 - **Structured, resilient logging:** newline-delimited JSON to stdout/stderr, with secrets (credentials, bearer tokens) redacted, control characters stripped, and messages length-bounded; stack traces and runtime build details are never logged. A broken or blocked log sink (for example, a closed pipe) is isolated and never crashes the server.

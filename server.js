@@ -101,7 +101,12 @@ function readIntSetting(name, fallback, min, max) {
   if (raw === undefined || raw === '') return fallback;
   const n = parseIntStrict(raw);
   if (n === null) {
-    configErrors.push(name + '="' + raw + '" is not a valid integer');
+    // Finding F5: log ONLY the variable name and the validation class — NEVER the
+    // raw supplied value. An operator may pass a secret through the wrong variable
+    // (e.g. PORT="token=..."), and echoing the value verbatim would insert it into
+    // the structured stderr diagnostic (CWE-532: sensitive information in a log).
+    // The variable name alone is sufficient for an operator to locate and fix it.
+    configErrors.push(name + ' is not a valid integer');
     return fallback;
   }
   if (n < min || n > max) {
@@ -298,6 +303,13 @@ function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
+    // Finding F3: the body is authoritatively typed JSON; forbid MIME-sniffing so
+    // no client can be coerced into re-interpreting it as another content type.
+    'X-Content-Type-Options': 'nosniff',
+    // Finding F4: every response carries request-specific data — echoed client
+    // input, live health telemetry, or a request-specific error — so it must never
+    // be stored by a shared or browser cache.
+    'Cache-Control': 'no-store',
   });
   if (res.req && res.req.method === 'HEAD') {
     res.end();
@@ -566,7 +578,50 @@ function jsonDepthExceeds(text, maxDepth) {
   return false;
 }
 
+// Finding F2: count occurrences of a header (by lower-cased name) in the RAW,
+// unmerged header list, case-insensitively. Node collapses duplicate SINGLETON
+// headers such as Content-Type in `req.headers` down to the FIRST value, which
+// would make media-type validation depend on attacker-controlled header order
+// (a JSON-first request would be accepted while a text-first request with the
+// SAME two headers would be rejected). `req.rawHeaders` is a flat
+// [name, value, name, value, ...] array that preserves every occurrence, so a
+// conflicting/duplicate singleton header can be detected regardless of order or
+// header-name casing. Never throws.
+function rawHeaderCount(req, lowerName) {
+  let count = 0;
+  const raw = req && req.rawHeaders;
+  if (Array.isArray(raw)) {
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      const key = raw[i];
+      if (typeof key === 'string' && key.toLowerCase() === lowerName) count += 1;
+    }
+  }
+  return count;
+}
+
+// Finding F1: a STRICT UTF-8 decoder for request bodies. Buffer#toString('utf8')
+// silently substitutes U+FFFD for malformed bytes (a lone continuation byte, an
+// invalid lead byte, a truncated multibyte sequence, or an overlong encoding) and
+// then JSON.parse happily accepts the mangled string — so the server would return
+// 200 for a body that was never valid UTF-8, corrupting the client's bytes. A
+// `fatal` decoder throws on invalid input so it can be mapped to a deterministic
+// 400 instead. `ignoreBOM: true` keeps a leading BOM in the decoded output (rather
+// than silently stripping it), preserving the prior behavior where a BOM-prefixed
+// body is rejected by JSON.parse as malformed. A single non-streaming decoder is
+// safe to reuse: each decode() call is self-contained and resets even after a
+// throw.
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
 async function handleEcho(req, res) {
+  // Finding F2: a conflicting/duplicate singleton Content-Type is a malformed
+  // request (RFC 7230 forbids multiple values for a singleton field). Reject it
+  // deterministically with 400 — independent of arrival order and header-name
+  // casing — BEFORE selecting a media type, instead of honoring whichever value
+  // happened to arrive first. The body is still unread, so route through
+  // endWithError (Connection: close + abort the unread upload after the flush).
+  if (rawHeaderCount(req, 'content-type') > 1) {
+    return endWithError(req, res, 400, 'Duplicate Content-Type header');
+  }
   const ctype = (req.headers['content-type'] || '')
     .split(';')[0].trim().toLowerCase();
   if (ctype !== 'application/json') {
@@ -588,12 +643,22 @@ async function handleEcho(req, res) {
   }
   let parsed;
   if (raw.length) {
-    const text = raw.toString('utf8');
-    // Finding F1: pre-validate nesting depth BEFORE JSON.parse. A pathologically
-    // deep — but syntactically valid — payload would otherwise drive JSON.parse
-    // into a recursive descent that overflows the call stack; with the stack
-    // already exhausted, even the malformed-JSON 400 path below would re-throw and
-    // the client fault would surface as a misleading 500. Rejecting over-depth
+    // Finding F1: decode with a FATAL UTF-8 decoder. Buffer#toString('utf8') would
+    // replace malformed bytes with U+FFFD and let JSON.parse accept the result,
+    // silently mangling the client's bytes and returning 200. Rejecting invalid
+    // UTF-8 here maps the client fault to a deterministic 400 before any parsing.
+    let text;
+    try {
+      text = utf8Decoder.decode(raw);
+    } catch (_) {
+      // The body has been fully consumed, so a 400 is safe on a keep-alive socket.
+      return sendError(res, 400, 'Request body is not valid UTF-8');
+    }
+    // Finding F1 (depth): pre-validate nesting depth BEFORE JSON.parse. A
+    // pathologically deep — but syntactically valid — payload would otherwise drive
+    // JSON.parse into a recursive descent that overflows the call stack; with the
+    // stack already exhausted, even the malformed-JSON 400 path below would re-throw
+    // and the client fault would surface as a misleading 500. Rejecting over-depth
     // input here maps the client fault to a deterministic 400 (a 4xx, per the AAP)
     // and guarantees JSON.parse only ever runs on bounded-depth input.
     if (jsonDepthExceeds(text, config.maxJsonDepth)) {
@@ -721,6 +786,16 @@ const server = http.createServer(
 server.requestTimeout = config.requestTimeoutMs;
 server.headersTimeout = config.headersTimeoutMs;
 server.keepAliveTimeout = config.keepAliveTimeoutMs;
+// Node >=19 adds an internal `keepAliveTimeoutBuffer` (default 1000ms) that is
+// applied ON TOP OF `keepAliveTimeout` before an idle keep-alive socket is
+// actually closed. Left at its default, the effective idle timeout would be
+// KEEPALIVE_TIMEOUT_MS + 1000ms — diverging from the configured/documented value.
+// Neutralize the buffer so KEEPALIVE_TIMEOUT_MS is the authoritative effective
+// idle-socket timeout. The `typeof` guard keeps older runtimes (which lack the
+// property) unaffected.
+if (typeof server.keepAliveTimeoutBuffer === 'number') {
+  server.keepAliveTimeoutBuffer = 0;
+}
 server.timeout = config.requestTimeoutMs;
 // Finding 8: bound the number of headers a single request may carry. Without an
 // explicit limit this small API would accept thousands of headers (a cheap
@@ -752,6 +827,11 @@ function rawHttpErrorResponse(statusCode, extraHeaders) {
     'HTTP/1.1 ' + statusCode + ' ' + reason + '\r\n' +
     'Content-Type: application/json; charset=utf-8\r\n' +
     'Content-Length: ' + Buffer.byteLength(body) + '\r\n' +
+    // Findings F3/F4: mirror the security headers emitted by the sendJson path so
+    // raw protocol-layer error responses (clientError 400/408, CONNECT 405) are
+    // equally non-sniffable and non-cacheable.
+    'X-Content-Type-Options: nosniff\r\n' +
+    'Cache-Control: no-store\r\n' +
     'Connection: close\r\n';
   if (extraHeaders) {
     for (const key of Object.keys(extraHeaders)) {

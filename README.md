@@ -1,19 +1,22 @@
 # Hardened HTTP Server
 
-A production-grade, **dependency-free** Node.js HTTP server built entirely on Node.js built-in modules. It demonstrates comprehensive error handling, graceful shutdown, input validation, resource cleanup, and robust HTTP request processing.
+A production-grade Node.js HTTP server built on **Express**, layered over a hardened Node.js `http` transport. It demonstrates comprehensive error handling, graceful shutdown, input validation, resource cleanup, and robust HTTP request processing.
 
 ## Overview
 
-This server is a single self-contained entrypoint (`server.js`) that runs on any Node.js `>=18` runtime with **no `npm install`** and **no third-party packages**. All configuration is provided at runtime through environment variables with safe defaults.
+This server is a single self-contained entrypoint (`server.js`) that runs on any Node.js `>=18` runtime. [Express](https://expressjs.com/) provides the application-layer router, while the surrounding Node.js `http` server supplies the transport- and process-level hardening (configured timeouts, a socket registry, graceful shutdown, protocol-level error handling, and process guards). Install the dependency once with `npm install`; all runtime configuration is then provided through environment variables with safe defaults.
 
 ## Prerequisites
 
 - Node.js **>= 18** (tested on Node **v22.23.1**).
-- No dependencies to install — the server uses only the Node.js standard library: the `http` and `os` modules (loaded via `require`) plus the always-global `URL` and `process` APIs (no `require` needed).
+- One dependency: [Express](https://expressjs.com/) (`^5.2.1`), installed with `npm install`. Aside from Express, the server uses only the Node.js standard library: the `http` and `os` modules plus the always-global `URL` and `process` APIs.
 
 ## Running the Server
 
 ```bash
+# Install dependencies (Express) — required once before the first run:
+npm install
+
 # Start the server (defaults to http://0.0.0.0:3000)
 npm start
 # or, equivalently:
@@ -52,10 +55,24 @@ All settings are environment variables with safe defaults:
 
 | Method | Path | Description | Success |
 |---|---|---|---|
+| `GET` / `HEAD` | `/` | Greeting endpoint | `200` `text/plain` body `Hello world` |
+| `GET` / `HEAD` | `/good-morning` | Greeting endpoint | `200` `text/plain` body `Good morning` |
 | `GET` / `HEAD` | `/health` (aliases `/healthz`, `/readyz`) | Liveness/readiness probe | `200` JSON `{status, uptimeSeconds, pid, host, timestamp}` |
 | `POST` | `/echo` | Validates and echoes a JSON body | `200` JSON `{received: <parsed body>}` |
 
-> **`HEAD` requests** return the same status line and headers as the equivalent `GET` — including a `Content-Length` computed from the JSON body — but **no response body** (0 bytes), per the HTTP specification.
+Quick check:
+
+```bash
+curl http://localhost:3000/               # -> Hello world
+curl http://localhost:3000/good-morning   # -> Good morning
+curl http://localhost:3000/health         # -> {"status":"ok",...}
+curl -X POST http://localhost:3000/echo \
+  -H 'Content-Type: application/json' -d '{"hello":"world"}'   # -> {"received":{"hello":"world"}}
+```
+
+> **`HEAD` requests** return the same status line and headers as the equivalent `GET` — including a `Content-Length` computed from the body — but **no response body** (0 bytes), per the HTTP specification. Express serves `HEAD` automatically for each `GET` route above.
+
+> The `/` and `/good-morning` greeting routes return `text/plain` with the same `X-Content-Type-Options: nosniff` and `Cache-Control: no-store` headers as the JSON routes, and are subject to the same `MAX_BODY_BYTES` cap.
 
 ### Response Status Codes
 
@@ -70,7 +87,7 @@ All settings are environment variables with safe defaults:
 | `415` | `Content-Type` is not `application/json` for `POST /echo` |
 | `417` | Unsupported `Expect` request-header value |
 | `500` | Unexpected server error (no stack trace is leaked to the client) |
-| `503` | Server is shutting down; a request that reaches the dispatcher during draining is refused with this status (see [Graceful Shutdown](#graceful-shutdown)) |
+| `503` | Server is shutting down; a request that reaches the router during draining is refused with this status by the shutdown-gate middleware (see [Graceful Shutdown](#graceful-shutdown)) |
 
 All error responses are generic JSON of the form `{ "error": "<status message>", "status": <code>, "detail"?: "<short reason>" }`. The optional `detail` field carries a brief, non-sensitive reason (for example, `"Content-Type must be application/json"`) and is omitted when there is none. Stack traces are never exposed to clients.
 
@@ -90,7 +107,7 @@ On `SIGTERM` or `SIGINT` the server drains in-flight work and then exits:
 
 1. It enters a **draining** state and stops accepting new connections via `server.close()`. From this point:
    - **New TCP connections are refused** — the listening socket is closed, so a client opening a fresh connection sees a connection error (e.g. `ECONNREFUSED`), not an HTTP response.
-   - **Requests that still reach the dispatcher** on an already-established connection are refused with `503` and `Connection: close`.
+   - **Requests that still reach the router** on an already-established connection are refused with `503` and `Connection: close` by the shutdown-gate middleware.
    - **Idle keep-alive sockets** are destroyed immediately from the socket registry so draining completes promptly; a socket serving an active request is left alone until its response finishes.
 2. In-flight requests are allowed to complete; each response is sent with `Connection: close`.
 3. Once all in-flight work has drained, the process **exits `0`** (clean shutdown).
@@ -102,7 +119,8 @@ Process-level `uncaughtException` and `unhandledRejection` handlers log a **sani
 
 ## Robustness Features
 
-- **Error handling:** try/catch around handler logic, `req`/`res` `error`/`aborted` listeners, protocol-level `clientError`/`CONNECT`/`Expect` handling, `server.on('error')` for `EADDRINUSE`/`EACCES`, and process-level `uncaughtException`/`unhandledRejection` guards.
+- **Architecture:** [Express](https://expressjs.com/) is the application-layer router (mounted as the `http.Server` request listener), so all of the transport- and process-level hardening below is applied by the surrounding Node.js `http` server and is independent of the routing framework. A shutdown-gate middleware and a method allow-list middleware run ahead of every route; the greeting routes (`/`, `/good-morning`) return `text/plain`, while `/health` and `/echo` are handled by the same hardened handlers as before.
+- **Error handling:** try/catch around handler logic, a terminal Express error handler that emits a generic `500` (never a stack trace), `req`/`res` `error`/`aborted` listeners, protocol-level `clientError`/`CONNECT`/`Expect` handling, `server.on('error')` for `EADDRINUSE`/`EACCES`, and process-level `uncaughtException`/`unhandledRejection` guards.
 - **Graceful shutdown:** connection draining, idle keep-alive socket teardown, a bounded force-exit timer, and a monotonic **non-zero** exit code on forced or fatal termination.
 - **Input validation:** method allow-list (`405`), WHATWG `URL` parsing (`400`), `Content-Type` verification (`415`), body-size cap (`413`), a JSON nesting-depth cap (`400`, bounded *before* `JSON.parse` so a pathologically deep payload cannot exhaust the call stack), and guarded `JSON.parse` (`400`).
 - **Resource cleanup:** configured `requestTimeout`, `headersTimeout`, `keepAliveTimeout` (with Node's internal keep-alive buffer neutralized to `0` so `KEEPALIVE_TIMEOUT_MS` is the effective idle-socket timeout), and socket timeouts; oversized/stalled bodies aborted; timers cleared on shutdown.

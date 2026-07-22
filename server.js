@@ -1,13 +1,24 @@
 'use strict';
 
 /**
- * Hardened Node.js HTTP server (dependency-free, Node >= 18).
+ * Hardened Node.js HTTP server (Express-based, Node >= 18).
  * Addresses: error handling, graceful shutdown, input validation,
  * resource cleanup, and robust HTTP request processing.
+ *
+ * Express is used strictly as the application-layer router. All process- and
+ * transport-level hardening (configured timeouts, the socket registry, graceful
+ * shutdown, clientError/CONNECT/expectation handling, and the uncaughtException
+ * / unhandledRejection guards) is provided by the surrounding http.Server and is
+ * unaffected by the router choice.
  */
 
 const http = require('http');
 const os = require('os');
+// Refine PR: Express is the application-layer router (see the Express
+// application block below). It is invoked as the http.Server request listener
+// from requestHandler, so every transport- and process-level defense in this
+// file continues to apply unchanged.
+const express = require('express');
 
 // --- Finding 5: log-sink resilience (defined FIRST so every subsequent log
 // write, including early configuration-error writes emitted during module load,
@@ -529,10 +540,11 @@ async function handleHealth(req, res) {
     if (err.aborted) return; // client went away; nothing to send
     throw err;
   }
-  // Finding 10: dispatch() applies the shutdown gate synchronously and returns
-  // 503 for every new request once draining begins, so a health handler only
-  // runs while NOT draining. The previously-conditional `status: 'draining'`
-  // value was therefore unreachable dead code; report a constant 'ok'.
+  // Finding 10: the shutdown-gate middleware (registered first on the Express
+  // app) rejects every new request with 503 once draining begins, so a health
+  // handler only runs while NOT draining. The previously-conditional
+  // `status: 'draining'` value was therefore unreachable dead code; report a
+  // constant 'ok'.
   sendJson(res, 200, {
     status: 'ok',
     uptimeSeconds: Math.round(process.uptime()),
@@ -677,36 +689,122 @@ async function handleEcho(req, res) {
   sendJson(res, 200, { received: parsed });
 }
 
-// --- Request dispatcher ---
-async function dispatch(req, res) {
-  // Every early rejection below routes through endWithError so that a request
-  // carrying an (unread) body cannot leave the socket occupied until timeout,
-  // and — during shutdown — the connection is correctly closed (Findings 4, 7).
+// --- Plain-text greeting handler (shared by GET / and GET /good-morning) ---
+// Applies the SAME body-size cap as every other route (Finding 2): a normal GET
+// carries no body so readBody resolves immediately, while a body-bearing or
+// slowly-trickled request is bounded by the same reader (413 on overflow) and
+// cannot bypass MAX_BODY_BYTES nor hold the socket open past the response. Emits
+// the same non-sniffable (X-Content-Type-Options) / non-cacheable (Cache-Control)
+// headers as the centralized JSON responder so every response surface is
+// consistent. Async so its rejection can be forwarded to Express's error handler.
+async function greet(req, res, message) {
+  try {
+    await readBody(req, config.maxBodyBytes);
+  } catch (err) {
+    if (err.statusCode === 413) {
+      return endWithError(req, res, 413, 'Body exceeds maximum allowed size');
+    }
+    if (err.aborted) return; // client went away; nothing to send
+    throw err;
+  }
+  // Guard against a response that is already committed/ended or whose socket is
+  // gone (mirrors sendJson's guard) so a late write can never throw.
+  if (res.headersSent || res.writableEnded || res.destroyed || res.writable === false) return;
+  res
+    .status(200)
+    .type('text/plain; charset=utf-8')
+    .set('X-Content-Type-Options', 'nosniff')
+    .set('Cache-Control', 'no-store')
+    .send(message);
+}
+
+// --- Express application (request router) ---
+// Refine PR: Express owns ONLY path/method routing and application responses. It
+// is invoked as the http.Server request listener from requestHandler (below), so
+// every transport- and process-level defense in this file (configured timeouts,
+// the socket registry, graceful shutdown, clientError/CONNECT/expectation
+// handling, and the uncaughtException/unhandledRejection guards) continues to
+// apply unchanged. HEAD is served automatically for the GET routes below (Express
+// maps HEAD to the matching GET handler and suppresses the body).
+const app = express();
+
+// Do not advertise the framework/version in responses (avoids fingerprinting and
+// preserves this file's no-information-leakage posture).
+app.disable('x-powered-by');
+// Responses are request-specific and already marked `Cache-Control: no-store`, so
+// a validator ETag is meaningless here; disable it to avoid a misleading header.
+app.set('etag', false);
+
+// Middleware 1 — shutdown drain gate: once graceful shutdown has begun, every new
+// request is rejected with 503 (Connection: close + unread-body abort via
+// endWithError), exactly as the previous dispatcher did (Findings 4, 7). Runs
+// before any routing work.
+app.use((req, res, next) => {
   if (shuttingDown) {
     return endWithError(req, res, 503, 'Server is shutting down');
   }
+  next();
+});
+
+// Middleware 2 — method allow-list: preserve the AAP input-validation guarantee
+// that any method outside {GET, HEAD, POST} is rejected with 405 (advertising
+// Allow), rather than surfacing as a router 404 for an unmatched method.
+app.use((req, res, next) => {
   if (!ALLOWED_METHODS.has(req.method)) {
     return endWithError(req, res, 405, `Method ${req.method} not allowed`, {
       Allow: Array.from(ALLOWED_METHODS).join(', '),
     });
   }
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  } catch (_) {
-    return endWithError(req, res, 400, 'Invalid request URL');
-  }
-  const pathname = parsedUrl.pathname;
+  next();
+});
 
-  if ((req.method === 'GET' || req.method === 'HEAD') &&
-      (pathname === '/health' || pathname === '/healthz' || pathname === '/readyz')) {
-    return handleHealth(req, res);
+// Route: GET / — the tutorial's primary endpoint; returns the plain-text
+// greeting "Hello world". Any async rejection is forwarded to the terminal
+// Express error handler below.
+app.get('/', (req, res, next) => {
+  greet(req, res, 'Hello world').catch(next);
+});
+
+// Route: GET /good-morning — added per the Refine PR request; returns the
+// plain-text greeting "Good morning".
+app.get('/good-morning', (req, res, next) => {
+  greet(req, res, 'Good morning').catch(next);
+});
+
+// Route: health/readiness probes (GET, and HEAD via Express's automatic mapping).
+// Delegates to the existing hardened handler (which also enforces the body cap).
+app.get(['/health', '/healthz', '/readyz'], (req, res, next) => {
+  handleHealth(req, res).catch(next);
+});
+
+// Route: POST /echo — delegates to the existing hardened handler (duplicate/
+// conflicting Content-Type detection, Content-Type check, streamed body cap,
+// strict UTF-8 decode, JSON-depth guard, safe JSON parse). Deliberately NO
+// body-parsing middleware is registered, so the raw request stream reaches
+// handleEcho and its defenses remain authoritative.
+app.post('/echo', (req, res, next) => {
+  handleEcho(req, res).catch(next);
+});
+
+// Unmatched route -> generic 404 (Connection: close + unread-body abort).
+app.use((req, res) => {
+  endWithError(req, res, 404, 'Resource not found');
+});
+
+// Terminal Express error handler -> generic 500 via the centralized responder;
+// never leaks a stack trace. Keeps the 4-argument signature so Express recognizes
+// it as an error handler. No-throw.
+app.use((err, req, res, _next) => {
+  try {
+    log.error('unhandled request error', {
+      error: describeThrown(err).message,
+      path: safePath(req),
+    });
+    failRequest(res, 500);
+  } catch (_) {
+    try { if (res.socket && !res.socket.destroyed) res.socket.destroy(); } catch (_) { /* no-throw */ }
   }
-  if (req.method === 'POST' && pathname === '/echo') {
-    return handleEcho(req, res);
-  }
-  return endWithError(req, res, 404, 'Resource not found');
-}
+});
 
 // Lifecycle invariant (Finding 5): socket._activeRequests holds the number of
 // in-flight requests on a (possibly pipelined/keep-alive) connection. It is
@@ -753,18 +851,22 @@ function requestHandler(req, res) {
     log.warn('request aborted by client', { path: safePath(req) });
   });
 
-  Promise.resolve()
-    .then(() => dispatch(req, res))
-    .catch((err) => {
-      // Terminal, no-throw error handling: this catch must never itself throw or
-      // reject (Finding 3), so both logging and finalization are guarded.
-      try {
-        log.error('unhandled request error', { error: describeThrown(err).message, path: safePath(req) });
-        failRequest(res, 500);
-      } catch (_) {
-        try { if (res.socket && !res.socket.destroyed) res.socket.destroy(); } catch (_) { /* no-throw */ }
-      }
-    });
+  // Delegate routing to the Express application. Express catches synchronous
+  // errors thrown in its middleware/route handlers and forwards them to the
+  // terminal error handler (generic 500); async handler rejections are forwarded
+  // there too via `.catch(next)` at each route. This surrounding try/catch is a
+  // last-resort, no-throw guard for a throw from Express's own dispatch machinery,
+  // so requestHandler can never propagate an error (which would crash the process).
+  try {
+    app(req, res);
+  } catch (err) {
+    try {
+      log.error('unhandled request error', { error: describeThrown(err).message, path: safePath(req) });
+      failRequest(res, 500);
+    } catch (_) {
+      try { if (res.socket && !res.socket.destroyed) res.socket.destroy(); } catch (_) { /* no-throw */ }
+    }
+  }
 }
 
 // --- Server + socket registry ---

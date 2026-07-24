@@ -1,0 +1,17 @@
+{
+  "name": "nodejs-express-tutorial",
+  "version": "1.0.0",
+  "description": "A minimal ExpressJS tutorial server exposing two plain-text GET endpoints.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "private": true,
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
